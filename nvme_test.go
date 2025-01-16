@@ -17,6 +17,7 @@ package gobrick
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/dell/gonvme"
 
+	mh "github.com/dell/gobrick/internal/mockhelper"
 	intmultipath "github.com/dell/gobrick/internal/multipath"
 	intscsi "github.com/dell/gobrick/internal/scsi"
 	wrp "github.com/dell/gobrick/internal/wrappers"
@@ -95,7 +97,7 @@ type NVMEFields struct {
 }
 
 func getDefaultNVMEFields(ctrl *gomock.Controller) NVMEFields {
-	con := NewNVMeConnector(NVMeConnectorParams{})
+	con := NewNVMeConnector(NVMeConnectorParams{MultipathFlushTimeout: 1})
 	bc := con.baseConnector
 	mpMock := intmultipath.NewMockMultipath(ctrl)
 	scsiMock := intscsi.NewMockSCSI(ctrl)
@@ -120,8 +122,9 @@ func getDefaultNVMEFields(ctrl *gomock.Controller) NVMEFields {
 
 func TestNVME_Connector_ConnectVolume(t *testing.T) {
 	type args struct {
-		ctx  context.Context
-		info NVMeVolumeInfo
+		ctx   context.Context
+		info  NVMeVolumeInfo
+		useFc bool
 	}
 
 	ctx := context.Background()
@@ -136,16 +139,143 @@ func TestNVME_Connector_ConnectVolume(t *testing.T) {
 		stateSetter func(fields NVMEFields)
 		want        Device
 		wantErr     bool
-		isFC        bool
+	}{
+		{
+			name:        "Without any targets",
+			fields:      getDefaultNVMEFields(ctrl),
+			stateSetter: func(_ NVMEFields) {},
+			args: args{
+				ctx:   ctx,
+				info:  NVMeVolumeInfo{},
+				useFc: false,
+			},
+			want:    Device{},
+			wantErr: true,
+		},
+		// {
+		// 	name:        "Incorrect targets",
+		// 	fields:      getDefaultNVMEFields(ctrl),
+		// 	stateSetter: func(_ NVMEFields) {},
+		// 	args: args{
+		// 		ctx: ctx,
+		// 		info: NVMeVolumeInfo{
+		// 			Targets: []NVMeTargetInfo{
+		// 				{Portal: "", Target: ""},
+		// 			},
+		// 		},
+		// 		useFc: false,
+		// 	},
+		// },
+		{
+			name:        "Invalid volume wwn",
+			fields:      getDefaultNVMEFields(ctrl),
+			stateSetter: func(_ NVMEFields) {},
+			args: args{
+				ctx: ctx,
+				info: NVMeVolumeInfo{
+					Targets: []NVMeTargetInfo{
+						{Portal: "test-portal", Target: "test-target"},
+					},
+					WWN: "",
+				},
+				useFc: false,
+			},
+			want:    Device{},
+			wantErr: true,
+		},
+		{
+			name:   "IsDaemonRunning true and Failed to connect volume",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.multipath.EXPECT().IsDaemonRunning(gomock.Any()).Return(true).AnyTimes()
+				// fields.nvmeLib.EXPECT().GetNVMeDeviceData(gomock.Any()).Return("", "", nil).AnyTimes()
+			},
+			args: args{
+				ctx: ctx,
+				info: NVMeVolumeInfo{
+					Targets: []NVMeTargetInfo{
+						{Portal: "test-portal", Target: "test-target"},
+					},
+					WWN: validNQN,
+				},
+				useFc: false,
+			},
+			want:    Device{},
+			wantErr: true,
+		},
+		{
+			name:   "IsDaemonRunning false and Failed to connect volume",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.multipath.EXPECT().IsDaemonRunning(gomock.Any()).Return(false).AnyTimes()
+			},
+			args: args{
+				ctx: ctx,
+				info: NVMeVolumeInfo{
+					Targets: []NVMeTargetInfo{
+						{Portal: "test-portal", Target: "test-target"},
+					},
+					WWN: validNQN,
+				},
+				useFc: false,
+			},
+			want:    Device{},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &NVMeConnector{
+				baseConnector:             tt.fields.baseConnector,
+				multipath:                 tt.fields.multipath,
+				scsi:                      tt.fields.scsi,
+				nvmeLib:                   tt.fields.nvmeLib,
+				manualSessionManagement:   tt.fields.manualSessionManagement,
+				waitDeviceTimeout:         tt.fields.waitDeviceTimeout,
+				waitDeviceRegisterTimeout: tt.fields.waitDeviceRegisterTimeout,
+				loginLock:                 tt.fields.loginLock,
+				limiter:                   tt.fields.limiter,
+				singleCall:                tt.fields.singleCall,
+				filePath:                  tt.fields.filePath,
+			}
+
+			tt.stateSetter(tt.fields)
+			got, err := c.ConnectVolume(tt.args.ctx, tt.args.info, tt.args.useFc)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ConnectVolume() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ConnectVolume() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNVME_Connector_DisconnectVolume(t *testing.T) {
+	type args struct {
+		ctx  context.Context
+		info NVMeVolumeInfo
+	}
+
+	ctx := context.Background()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name        string
+		fields      NVMEFields
+		args        args
+		stateSetter func(fields NVMEFields)
+		wantErr     bool
 	}{
 		{
 			name:        "empty request",
 			fields:      getDefaultNVMEFields(ctrl),
 			stateSetter: func(_ NVMEFields) {},
 			args:        args{ctx: ctx, info: NVMeVolumeInfo{}},
-			want:        Device{},
-			wantErr:     true,
-			isFC:        false,
+			wantErr:     false,
 		},
 	}
 	for _, tt := range tests {
@@ -164,13 +294,167 @@ func TestNVME_Connector_ConnectVolume(t *testing.T) {
 				filePath:                  tt.fields.filePath,
 			}
 			tt.stateSetter(tt.fields)
-			got, err := c.ConnectVolume(tt.args.ctx, tt.args.info, tt.isFC)
+			err := c.DisconnectVolume(tt.args.ctx, tt.args.info)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ConnectVolume() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("DisconnectVolume() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNVME_Connector_DisconnectVolumeByDeviceName(t *testing.T) {
+	type args struct {
+		ctx  context.Context
+		name string
+	}
+
+	ctx := context.Background()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name        string
+		fields      NVMEFields
+		args        args
+		stateSetter func(fields NVMEFields)
+		wantErr     bool
+	}{
+		{
+			name:   "empty request",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.scsi.EXPECT().IsDeviceExist(gomock.Any(), gomock.Any()).Return(false).AnyTimes()
+			},
+			args:    args{ctx: ctx, name: ""},
+			wantErr: false,
+		},
+		{
+			name:   "Disconnect with device mapper name",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.scsi.EXPECT().IsDeviceExist(gomock.Any(), gomock.Any()).Return(true).AnyTimes()
+				fields.scsi.EXPECT().GetDMChildren(gomock.Any(), gomock.Any()).Return([]string{}, nil).AnyTimes()
+				fields.scsi.EXPECT().GetNVMEDeviceWWN(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.scsi.EXPECT().GetDevicesByWWN(gomock.Any(), gomock.Any()).Return([]string{mh.ValidDeviceName}, nil).AnyTimes()
+				fields.scsi.EXPECT().GetDMDeviceByChildren(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.multipath.EXPECT().GetDMWWID(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.multipath.EXPECT().FlushDevice(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.multipath.EXPECT().RemoveDeviceFromWWIDSFile(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.scsi.EXPECT().DeleteSCSIDeviceByName(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			},
+			args:    args{ctx: ctx, name: mh.ValidDMName},
+			wantErr: false,
+		},
+		{
+			name:   "Disconnect with device mapper name AND failed to get children for DM",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.scsi.EXPECT().IsDeviceExist(gomock.Any(), gomock.Any()).Return(true).AnyTimes()
+				fields.scsi.EXPECT().GetDMChildren(gomock.Any(), gomock.Any()).Return([]string{}, errors.New("failed to get children for DM")).AnyTimes()
+				fields.scsi.EXPECT().GetDevicesByWWN(gomock.Any(), gomock.Any()).Return([]string{mh.ValidDeviceName}, nil).AnyTimes()
+				fields.multipath.EXPECT().GetDMWWID(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.scsi.EXPECT().GetDMDeviceByChildren(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.multipath.EXPECT().FlushDevice(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.multipath.EXPECT().RemoveDeviceFromWWIDSFile(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.scsi.EXPECT().DeleteSCSIDeviceByName(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			},
+			args:    args{ctx: ctx, name: mh.ValidDMName},
+			wantErr: false,
+		},
+		{
+			name:   "Disconnect with device name",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.scsi.EXPECT().IsDeviceExist(gomock.Any(), gomock.Any()).Return(true).AnyTimes()
+				fields.scsi.EXPECT().GetNVMEDeviceWWN(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.scsi.EXPECT().GetDevicesByWWN(gomock.Any(), gomock.Any()).Return([]string{mh.ValidDeviceName}, nil).AnyTimes()
+				fields.scsi.EXPECT().GetDMDeviceByChildren(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.multipath.EXPECT().GetDMWWID(gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+				fields.multipath.EXPECT().FlushDevice(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.multipath.EXPECT().RemoveDeviceFromWWIDSFile(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.scsi.EXPECT().DeleteSCSIDeviceByName(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			},
+			args:    args{ctx: ctx, name: mh.ValidDeviceName},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &NVMeConnector{
+				baseConnector:             tt.fields.baseConnector,
+				multipath:                 tt.fields.multipath,
+				scsi:                      tt.fields.scsi,
+				nvmeLib:                   tt.fields.nvmeLib,
+				manualSessionManagement:   tt.fields.manualSessionManagement,
+				waitDeviceTimeout:         tt.fields.waitDeviceTimeout,
+				waitDeviceRegisterTimeout: tt.fields.waitDeviceRegisterTimeout,
+				loginLock:                 tt.fields.loginLock,
+				limiter:                   tt.fields.limiter,
+				singleCall:                tt.fields.singleCall,
+				filePath:                  tt.fields.filePath,
+			}
+
+			tt.stateSetter(tt.fields)
+			err := c.DisconnectVolumeByDeviceName(tt.args.ctx, tt.args.name)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("DisconnectVolumeByDeviceName() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNVME_Connector_GetInitiatorName(t *testing.T) {
+	type args struct {
+		ctx  context.Context
+		info NVMeVolumeInfo
+	}
+
+	ctx := context.Background()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name        string
+		fields      NVMEFields
+		args        args
+		stateSetter func(fields NVMEFields)
+		want        []string
+		wantErr     bool
+	}{
+		{
+			name:        "request",
+			fields:      getDefaultNVMEFields(ctrl),
+			stateSetter: func(_ NVMEFields) {},
+			args:        args{ctx: ctx, info: NVMeVolumeInfo{}},
+			want:        []string{"nqn.1988-11.com.dell.mock:01:0000000000000"},
+			wantErr:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &NVMeConnector{
+				baseConnector:             tt.fields.baseConnector,
+				multipath:                 tt.fields.multipath,
+				scsi:                      tt.fields.scsi,
+				nvmeLib:                   tt.fields.nvmeLib,
+				manualSessionManagement:   tt.fields.manualSessionManagement,
+				waitDeviceTimeout:         tt.fields.waitDeviceTimeout,
+				waitDeviceRegisterTimeout: tt.fields.waitDeviceRegisterTimeout,
+				loginLock:                 tt.fields.loginLock,
+				limiter:                   tt.fields.limiter,
+				singleCall:                tt.fields.singleCall,
+				filePath:                  tt.fields.filePath,
+			}
+			tt.stateSetter(tt.fields)
+			got, err := c.GetInitiatorName(tt.args.ctx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetInitiatorName() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("ConnectVolume() got = %v, want %v", got, tt.want)
+				t.Errorf("GetInitiatorName() got = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -198,6 +482,98 @@ func TestNVME_wwnMatches(t *testing.T) {
 			c := &NVMeConnector{}
 			if c.wwnMatches(tt.nguid, tt.wwn) != tt.want {
 				t.Errorf("wwnMatches(%v, %v) = %v, want %v", tt.nguid, tt.wwn, !tt.want, tt.want)
+			}
+		})
+	}
+}
+
+func TestNVME_Connector_tryNVMeConnect(t *testing.T) {
+	type args struct {
+		ctx   context.Context
+		info  NVMeVolumeInfo
+		useFC bool
+	}
+
+	ctx := context.Background()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name        string
+		fields      NVMEFields
+		stateSetter func(fields NVMEFields)
+		args        args
+		wantErr     bool
+	}{
+		{
+			name:        "Without FC",
+			fields:      getDefaultNVMEFields(ctrl),
+			stateSetter: func(_ NVMEFields) {},
+			args: args{
+				ctx:   ctx,
+				info:  NVMeVolumeInfo{},
+				useFC: false,
+			},
+			wantErr: false,
+		},
+		{
+			name:   "connection with FC - Error in reading file",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.filePath.EXPECT().Glob(gomock.Any()).Return([]string{}, errors.New("error in matching files with pattern")).AnyTimes()
+			},
+			args: args{
+				ctx: ctx,
+				info: NVMeVolumeInfo{
+					Targets: []NVMeTargetInfo{
+						{Portal: "192.168.0.1", Target: "nqn-1"},
+					},
+					WWN: "",
+				},
+				useFC: true,
+			},
+			wantErr: true,
+		},
+		{
+			name:   "connection with FC",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.filePath.EXPECT().Glob(gomock.Any()).Return([]string{}, nil).AnyTimes()
+			},
+			args: args{
+				ctx: ctx,
+				info: NVMeVolumeInfo{
+					Targets: []NVMeTargetInfo{
+						{Portal: "192.168.0.1", Target: "nqn-1"},
+					},
+					WWN: "",
+				},
+				useFC: true,
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &NVMeConnector{
+				baseConnector:             tt.fields.baseConnector,
+				multipath:                 tt.fields.multipath,
+				scsi:                      tt.fields.scsi,
+				nvmeLib:                   tt.fields.nvmeLib,
+				manualSessionManagement:   tt.fields.manualSessionManagement,
+				waitDeviceTimeout:         tt.fields.waitDeviceTimeout,
+				waitDeviceRegisterTimeout: tt.fields.waitDeviceRegisterTimeout,
+				loginLock:                 tt.fields.loginLock,
+				limiter:                   tt.fields.limiter,
+				singleCall:                tt.fields.singleCall,
+				filePath:                  tt.fields.filePath,
+			}
+
+			tt.stateSetter(tt.fields)
+			err := c.tryNVMeConnect(tt.args.ctx, tt.args.info, tt.args.useFC)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("tryNVMeConnect() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
